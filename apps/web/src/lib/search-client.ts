@@ -40,6 +40,7 @@ type FallbackPayload<T> = {
   data?: T & { warnings?: string[] };
   error?: { message?: string; details?: string };
 };
+type TierFailure = { kind: AlgoliaFailureKind; consecutiveFailures: number };
 
 const STORAGE_KEY = "nthumods-search-backend";
 const FALLBACK_RETRY_MS = 5 * 60 * 1000;
@@ -47,6 +48,7 @@ const API_BASE = (import.meta.env.VITE_COURSEWEB_API_URL ?? "").replace(
   /\/$/,
   "",
 );
+const TRANSIENT_FAILURES_BEFORE_DEMOTION = 2;
 
 type PersistedState = {
   backend: SearchBackend;
@@ -345,6 +347,21 @@ export const createResilientSearchClient = (): ResilientSearchClient => {
       }
     };
 
+    const isRetriableTransient = (failure: TierFailure) =>
+      failure.kind === "transient" &&
+      failure.consecutiveFailures < TRANSIENT_FAILURES_BEFORE_DEMOTION;
+
+    const retryWindowElapsed = (state: PersistedState) =>
+      (state.retryAt ?? 0) <= Date.now();
+
+    const isBug = (kind: AlgoliaFailureKind) => kind === "bug";
+
+    const failWithoutDemoting = (tier: SearchBackend) => {
+      setLastError(true);
+      setWorkingState(tier);
+      return runEmpty();
+    };
+
     const attempt = async (
       backend: Exclude<SearchBackend, "fallback">,
     ): Promise<
@@ -357,7 +374,11 @@ export const createResilientSearchClient = (): ResilientSearchClient => {
     > => {
       const client = clientByBackend.get(backend);
       if (!client) {
-        return { ok: false, kind: "immediate", consecutiveFailures: 2 };
+        return {
+          ok: false,
+          kind: "immediate",
+          consecutiveFailures: TRANSIENT_FAILURES_BEFORE_DEMOTION,
+        };
       }
 
       try {
@@ -382,12 +403,9 @@ export const createResilientSearchClient = (): ResilientSearchClient => {
     ) => {
       const result = await attempt(backend);
       if (result.ok) return result.result;
-      if (result.kind === "bug") {
-        setLastError(true);
-        setWorkingState(backend);
-        return runEmpty();
-      }
-      if (result.kind === "transient" && result.consecutiveFailures < 2) {
+      if (isBug(result.kind)) failWithoutDemoting(backend);
+
+      if (isRetriableTransient(result)) {
         setFailureState(backend, result.consecutiveFailures);
         return runEmpty();
       }
@@ -395,18 +413,11 @@ export const createResilientSearchClient = (): ResilientSearchClient => {
       if (backend === "primary" && clientByBackend.has("backup")) {
         const backupResult = await attempt("backup");
         if (backupResult.ok) return backupResult.result;
-        if (
-          backupResult.kind === "transient" &&
-          backupResult.consecutiveFailures < 2
-        ) {
+        if (isRetriableTransient(result)) {
           setFailureState("backup", backupResult.consecutiveFailures);
           return runEmpty();
         }
-        if (backupResult.kind === "bug") {
-          setLastError(true);
-          setWorkingState("primary");
-          return runEmpty();
-        }
+        if (isBug(backupResult.kind)) failWithoutDemoting("primary");
       }
 
       setFallback();
@@ -423,38 +434,28 @@ export const createResilientSearchClient = (): ResilientSearchClient => {
     }
 
     if (activeState.backend === "fallback") {
-      if ((activeState.retryAt ?? 0) > Date.now()) return runFallback();
+      if (retryWindowElapsed(activeState)) return runFallback();
 
       const primaryResult = clientByBackend.has("primary")
         ? await attempt("primary")
         : undefined;
       if (primaryResult?.ok) return primaryResult.result;
-      if (primaryResult?.kind === "bug") {
-        setLastError(true);
-        setWorkingState("fallback");
-        return runEmpty();
-      }
+      if (primaryResult?.kind === "bug") failWithoutDemoting("fallback");
 
       const canTryBackup =
         primaryResult === undefined ||
         primaryResult.kind === "immediate" ||
         (primaryResult.kind === "transient" &&
-          primaryResult.consecutiveFailures >= 2);
+          primaryResult.consecutiveFailures >=
+            TRANSIENT_FAILURES_BEFORE_DEMOTION);
       if (canTryBackup && clientByBackend.has("backup")) {
         const backupResult = await attempt("backup");
         if (backupResult.ok) return backupResult.result;
-        if (
-          backupResult.kind === "transient" &&
-          backupResult.consecutiveFailures < 2
-        ) {
+        if (isRetriableTransient(backupResult)) {
           setFailureState("backup", backupResult.consecutiveFailures);
           return runEmpty();
         }
-        if (backupResult.kind === "bug") {
-          setLastError(true);
-          setWorkingState("fallback");
-          return runEmpty();
-        }
+        if (isBug(backupResult.kind)) failWithoutDemoting("fallback");
       } else if (primaryResult?.kind === "transient") {
         setPersistedState(
           "fallback",
@@ -471,15 +472,13 @@ export const createResilientSearchClient = (): ResilientSearchClient => {
 
     if (
       activeState.backend === "backup" &&
-      (activeState.retryAt ?? 0) <= Date.now() &&
+      !retryWindowElapsed(activeState) &&
       clientByBackend.has("primary")
     ) {
       const primaryResult = await attempt("primary");
       if (primaryResult.ok) return primaryResult.result;
-      if (primaryResult.kind === "bug") {
-        setLastError(true);
-        setWorkingState("backup");
-        return runEmpty();
+      if (isBug(primaryResult.kind)) {
+        failWithoutDemoting("fallback");
       }
       setWorkingState("backup");
     }
